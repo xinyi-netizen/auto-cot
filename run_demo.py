@@ -41,6 +41,9 @@ def parse_arguments():
 def main():
     args = parse_arguments()
     fix_seed(args.random_seed)
+    
+    # 1. 加载 Sentence Transformer 模型，用于把问题变成向量
+    # 这里使用的是 'all-MiniLM-L6-v2'，一个小巧高效的编码器
     encoder = SentenceTransformer(args.encoder)
 
     task = args.task
@@ -58,13 +61,22 @@ def main():
     else:
         num_clusters = 8
 
-    corpus = []
-    question = []
-    rationale = []
-    gold_ans = []
-    pred_ans = []
+    # 2. 读取预先跑好的 Zero-Shot-CoT 的日志文件
+    # Auto-CoT 的第一步是先用 "Let's think step by step" 跑一遍所有问题，
+    # 把生成的 "问题 + 错误的/正确的推理 + 答案" 存下来。
+    # 这里就是在读取那些原始素材。
+    corpus = []      # 存问题文本
+    question = []    # 存问题
+    rationale = []   # 存推理过程 (Rationale)
+    gold_ans = []    # 存标准答案 (用于调试，实际构造时不应看答案)
+    pred_ans = []    # 存预测答案
 
     with open(pred_file, "r", encoding="utf-8") as fp:
+
+        # ... (解析日志文件的代码，提取 Q, A, Rationale) ...
+        # c_rationale 就是模型生成的推理步骤
+        # c_pred_ans 就是模型生成的最终答案
+
         answer_seg = ""
         for line in fp:
             if "Q: " in line:
@@ -92,13 +104,20 @@ def main():
                     gold_ans.append(c_gold_ans)
                 answer_seg = ""
 
+    # 3. 【关键步骤】将所有问题编码成向量 (Embeddings)
+    # 这一步是为了理解问题的语义，以便后面做聚类。
     corpus_embeddings = encoder.encode(corpus)
 
-    # Perform kmean clustering
+     # 4. 【关键步骤】K-Means 聚类
+    # 为什么要聚类？因为如果随机选几个问题做示例，可能选到的都是相似的问题（比如都是加法）。
+    # Auto-CoT 认为示例需要有多样性 (Diversity)。聚类可以将相似的问题归为一组。
+    
     clustering_model = KMeans(n_clusters=num_clusters, random_state=args.random_seed)
     clustering_model.fit(corpus_embeddings)
-    cluster_assignment = clustering_model.labels_
+    cluster_assignment = clustering_model.labels_   # 每个问题属于哪个簇
 
+    # ... (整理聚类结果，计算每个点到簇中心的距离) ...
+    
     clustered_sentences = [[] for i in range(num_clusters)]
 
     dist = clustering_model.transform(corpus_embeddings)
@@ -111,29 +130,50 @@ def main():
 
     demos = []
 
+    # 5. 【关键步骤】从每个簇中挑选最具代表性的问题
+    # 遍历每一个簇 (Cluster)
     for i in range(len(clustered_dists)):
         print("Cluster ", i+1)
+        
+        # 获取该簇内所有问题到簇中心的距离，并排序
         tmp = list(map(list, zip(range(len(clustered_dists[i])), clustered_dists[i])))
         top_min_dist = sorted(tmp, key=lambda x: x[1], reverse=False)
         if not args.sampling == "center":
             random.shuffle(top_min_dist)
+        
+        # 遍历该簇中距离中心最近的问题
         for element in top_min_dist:
             min_idx = element[0]
+            # 获取该问题的推理过程和预测答案
             c_rationale = rationale[clustered_idx[i][min_idx]].strip()
             c_pred_ans = pred_ans[clustered_idx[i][min_idx]].strip()
-
+            
+            # 6. 【关键步骤】启发式过滤 (Heuristic Filtering)
+            # 我们不能盲目使用 Zero-Shot 生成的推理，因为可能是错的或者质量很差。
+            # 这里设置了一些简单的规则来过滤“坏的推理”：
+            # 1. 问题不能太长 (<= 60 tokens)
+            # 2. 推理步骤不能太长 (<= max_ra_len)
+            # 3. 推理过程必须以句号结尾 (完整的句子)
+            # 4. 必须有预测答案
             if len(question[clustered_idx[i][min_idx]].strip().split()) <= 60 \
                 and len(c_rationale.replace("\n\n", "\n").split("\n")) <= max_ra_len and c_rationale[-1] == "." and c_pred_ans != "":
+
+                # 5. 对于算术类任务的额外检查：
+                # 预测的答案必须出现在推理过程的末尾。    
                 if args.task in ["gsm8k", "multiarith", "singleeq", "addsub", "svamp"]:
                     if not (c_pred_ans.strip() in c_rationale.split(".")[-2] or c_pred_ans.strip() in c_rationale.split()[-10:]):
                         continue
                 c_question = question[clustered_idx[i][min_idx]]
                 c_rationale = c_rationale.replace("\n\n", "\n").replace("\n", " ").strip()
                 c_rationale = " ".join(c_rationale.split())
+                
                 if args.debug:
                     c_gold_ans = gold_ans[clustered_idx[i][min_idx]]
                 else:
                     c_gold_ans = None
+                
+                # 如果通过了所有检查，这个问题就被选为这个簇的 Representative Demo
+                # 把它加入到 demos 列表    
                 demo_element = {
                     "question": c_question,
                     "rationale": c_rationale,
@@ -146,8 +186,10 @@ def main():
                 print(c_pred_ans)
                 print(c_gold_ans)
                 print("")
-                break
+                break   # 每个簇只选一个，选到最好的就跳出，处理下一个簇
 
+    # 7. 保存生成的示例文件
+    # 这个文件后续会被 run_inference.py 读取，作为 prompt 的一部分
     demos = {"demo": demos}
 
     with open(args.demo_save_dir, 'w', encoding="utf-8") as write_f:
