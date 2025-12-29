@@ -53,15 +53,22 @@ def main():
             output_line["question"] = x
             output_line["gold_ans"] = y
 
+            # 拼接 Prompt 的逻辑
             if args.method == "zero_shot":
+                # 纯 Zero-shot: 问题 + "答案是"
                 x = x + " " + args.direct_answer_trigger_for_zeroshot
             elif args.method == "zero_shot_cot":
+                # Zero-shot-CoT: 问题 + "让我们一步步思考"
                 x = x + " " + args.cot_trigger
             elif args.method == "few_shot":
+                # 纯 Few-shot: 只有问题和答案的示例 + 当前问题
                 x = demo + x
             elif args.method == "few_shot_cot":
+                # Manual-CoT: 人写的带推理步骤的示例 + 当前问题
                 x = demo + x
             elif args.method == "auto_cot":
+                # Auto-CoT: run_demo.py 自动生成的示例 + "Let's think step by step"
+                # 注意：这里的 demo 包含了自动生成的 question 和 rationale
                 x = demo + x + " " + args.cot_trigger
             else:
                 raise ValueError("method is not properly defined ...")
